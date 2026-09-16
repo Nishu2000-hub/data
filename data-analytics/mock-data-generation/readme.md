@@ -1,1 +1,282 @@
+# Mock Data Generation — Virginia Analytics Tables
 
+Synthetic CSV data for the ten Virginia analytics tables, used for local
+development, API testing, dashboard testing and demonstrations.
+
+Issue: [#301](https://github.com/saayam-for-all/data/issues/301)
+
+No real or sensitive information is used anywhere in this data. Every name,
+email address, phone number, address and identifier is invented.
+
+---
+
+## Purpose
+
+The analytics dashboards and APIs need populated tables to develop and test
+against. Pointing local work at production is not an option, and the tables
+are largely empty in development environments. This generator produces a
+complete, internally consistent dataset that can be loaded into a local
+PostgreSQL instance in a few seconds.
+
+---
+
+## Tables included
+
+| CSV | Rows at `--rows 400` | Notes |
+|---|---|---|
+| `countries.csv` | 8 | Fixed reference data |
+| `states.csv` | 35 | Fixed reference data |
+| `cities.csv` | 77 | Fixed reference data, real centroids |
+| `help_categories.csv` | 80 | Official materialized-path `cat_id` values |
+| `users.csv` | 400 | Scales with `--rows` |
+| `volunteer_details.csv` | ~180 | ~45% of users become volunteers |
+| `user_skills.csv` | ~870 | ~2–3 skills per user |
+| `organizations.csv` | 400 | Scales with `--orgs` (defaults to `--rows`) |
+| `user_locations.csv` | ~280 | ~70% of users |
+| `volunteer_locations.csv` | ~145 | ~80% of volunteers |
+
+The four lookup tables are fixed in size because they hold real reference
+data. Everything else scales from `--rows`.
+
+---
+
+## Requirements
+
+Python 3.10 or newer. No third-party packages — the generator uses only the
+standard library, so there is no install step.
+
+---
+
+## How to run
+
+From this directory:
+
+```bash
+# Default: 400 users, 400 organizations, written to the current directory
+python generate_mock_data.py
+
+# Smaller dataset
+python generate_mock_data.py --rows 100
+
+# Larger dataset
+python generate_mock_data.py --rows 5000
+
+# Different number of organizations
+python generate_mock_data.py --rows 1000 --orgs 250
+
+# Write elsewhere
+python generate_mock_data.py --rows 400 --outdir ./generated
+
+# Different data, same structure
+python generate_mock_data.py --rows 400 --seed 99
+```
+
+### Configuring row counts
+
+`--rows` sets the size of the `users` table; the dependent tables scale from
+it. `--orgs` sets `organizations` independently and defaults to `--rows`.
+The lookup tables are fixed by the reference data.
+
+The generator has been run at 100, 400 and 5,000 users with all validation
+checks passing. It is not limited to those values.
+
+### Reproducibility
+
+Output is seeded. The same `--seed` and `--rows` always produce byte-identical
+files, which keeps regenerated CSVs out of git diffs unless something
+meaningful changed. The default seed is `42`.
+
+---
+
+## Table relationships
+
+Rows are generated in foreign-key dependency order, so a child row can only
+ever reference a parent that already exists:
+
+```
+countries
+  └── states                        states.country_id → countries.country_id
+        ├── cities                  cities.state_id → states.state_id
+        ├── organizations           organizations.state_id → states.state_id
+        └── users                   users.state_id → states.state_id
+              │                     users.country_id → countries.country_id
+              ├── user_locations    user_locations.user_id → users.user_id
+              ├── user_skills       user_skills.user_id → users.user_id
+              │                     user_skills.cat_id → help_categories.cat_id
+              └── volunteer_details volunteer_details.user_id → users.user_id
+                    └── volunteer_locations
+                                    volunteer_locations.user_id
+                                      → volunteer_details.user_id
+```
+
+Two relationships are easy to get wrong and are handled explicitly:
+
+- `volunteer_locations.user_id` references **`volunteer_details.user_id`**, not
+  `users.user_id`. Only users who have a `volunteer_details` row are eligible.
+  `user_locations.user_id`, by contrast, does reference `users.user_id` directly.
+- `organizations` is the child in its relationship with `states`:
+  `organizations.state_id` is the foreign key, `states.state_id` is the
+  referenced primary key.
+
+`states.country_id` is `NOT NULL`, so every state references a real country.
+
+---
+
+## Geographic consistency
+
+Geography is real, not random. Each state belongs to a real country, each city
+belongs to its real state, and each city carries its true centroid coordinates.
+
+A user's `country_id`, `state_id`, `city_name`, `zip_code`, `primary_phone_number`
+dial code and `last_location` are all derived from one chosen city, so they
+always agree with each other. The same applies to organizations.
+
+`volunteer_locations` and `user_locations` store raw geographic points rather
+than `city_id`/`state_id`. Their coordinates are generated by jittering the
+user's own city centroid by up to ~25 km, so a point always falls plausibly
+within the region the user is assigned to. `prev_loc` is a second point near
+`curr_loc`, matching the schema trigger that shifts `curr_loc` into `prev_loc`
+on update. About 30% of rows have a `NULL` `prev_loc`, representing a location
+that has been recorded only once.
+
+---
+
+## Column formats
+
+A few columns need specific formatting to load correctly:
+
+| Column | Type | Format written |
+|---|---|---|
+| `users.last_location` | `point` | `(37.338200,-121.886300)` |
+| `user_locations.curr_loc` / `prev_loc` | `geography(Point, 4326)` | `SRID=4326;POINT(-121.886300 37.338200)` |
+| `volunteer_locations.curr_loc` / `prev_loc` | `geography(Point, 4326)` | same as above |
+| `volunteer_details.availability_days` | `JSONB` | `["Monday", "Thursday"]` |
+| `volunteer_details.availability_times` | `JSONB` | `["09:00-12:00"]` |
+| all timestamps | `TIMESTAMP WITHOUT TIME ZONE` | `2026-08-31 14:30:00` |
+| `users.dob` | `DATE` | `1989-04-17` |
+| booleans | `BOOLEAN` | `true` / `false` |
+
+Note the axis order in the EWKT points: PostGIS expects
+`POINT(longitude latitude)`, not latitude first.
+
+`users.user_id` and `organizations.org_id` follow the formats produced by the
+database's own sequence triggers (`generate_sid()` and `generate_org_id()`):
+
+```
+SID-00-000-000-000-000-001
+ORG-000-000-000-0001
+```
+
+---
+
+## Output file locations
+
+CSVs are written to `--outdir`, which defaults to the current directory. In
+the repository they live alongside the scripts:
+
+```
+data-analytics/mock-data-generation/
+├── generate_mock_data.py
+├── utils.py
+├── reference_data.py
+├── load_test.sql
+├── README.md
+├── countries.csv
+├── states.csv
+├── cities.csv
+├── help_categories.csv
+├── users.csv
+├── volunteer_details.csv
+├── user_skills.csv
+├── organizations.csv
+├── user_locations.csv
+└── volunteer_locations.csv
+```
+
+---
+
+## Validation
+
+The generator validates its own output before writing and exits non-zero if
+any check fails. Checks cover:
+
+- primary key uniqueness on all ten tables, including the composite
+  `(user_id, cat_id)` key on `user_skills`
+- every foreign key relationship listed above, with no orphan values
+- `states.country_id` is never null
+- a user's and an organization's city belongs to its state
+- phone dial code matches the row's country
+- `created_at <= last_updated_at` wherever both columns exist
+- `org_rating` within the `CHECK (1..5)` range, with blank for unrated
+- `web_url LIKE 'http%'` and `email LIKE '%@%'`, matching the CHECK constraints
+
+Run the generator and read the report:
+
+```bash
+python generate_mock_data.py --rows 400
+```
+
+### Verifying the CSVs load into PostgreSQL
+
+`load_test.sql` creates the ten tables in a scratch schema and `\copy`s every
+CSV into them. Against a local PostgreSQL with PostGIS:
+
+```bash
+docker run --name saayam-mock-pg \
+  -e POSTGRES_PASSWORD=localtest \
+  -e POSTGRES_DB=saayam_local \
+  -p 5432:5432 -d postgis/postgis:16-3.4
+
+# wait a few seconds for the server to accept connections
+psql "postgresql://postgres:localtest@localhost:5432/saayam_local" \
+     -v ON_ERROR_STOP=1 -f load_test.sql
+
+docker rm -f saayam-mock-pg
+```
+
+The script prints a row count per table and runs the foreign-key and
+geographic-consistency checks again in SQL. PostGIS is required because
+`user_locations` and `volunteer_locations` use `geography(Point, 4326)`.
+
+---
+
+## Notes and assumptions
+
+**Table naming.** The issue specifies the pluralized names (`countries`,
+`states`, `cities`) adopted in the rename of 17 August 2026. The database wiki
+was last edited on 15 July 2026 and still shows the singular forms in its DDL
+blocks. Filenames here follow the issue; column names follow the wiki DDL.
+
+**`cities.lattitude`.** Spelled with two t's in the DDL. Preserved verbatim so
+the CSV header matches the real column name rather than silently correcting it.
+
+**`users.state_id` width.** `users.state_id` is `VARCHAR(30)` while
+`states.state_id` is `VARCHAR(50)`. State ids here are short slugs such as
+`US-CA`, so they fit both. Worth raising with the database team as a schema
+inconsistency.
+
+**`users.language_1/2/3`.** These are `BIGINT` foreign keys to
+`supporting_languages(language_id)`, a table outside the scope of this issue.
+A small fixed set of ids (1–8) is used. If `supporting_languages` is later
+included in the mock dataset, the pool in `reference_data.LANGUAGE_IDS` should
+be regenerated from it.
+
+**`users.user_status_id`.** References `user_status`, also outside this issue's
+scope. Values 1–3 are used, weighted toward 1.
+
+**Email and phone safety.** Email domains are `example.com`, `example.org`,
+`example.net` and `mail.example.com`, all reserved by RFC 2606 and incapable of
+receiving mail. Phone numbers use the `555` prefix reserved for fictional use.
+Neither can reach a real person.
+
+---
+
+## Adding a table
+
+1. Add its column order to `COLUMNS` in `generate_mock_data.py`, matching the
+   DDL order exactly.
+2. Write a `generate_<table>()` function that takes its parent rows as input.
+3. Call it in `main()` **after** its parents.
+4. Add primary key and foreign key entries to `validate()`.
+5. Add the `CREATE TABLE` and `\copy` to `load_test.sql`.
+6. Update the table list in this README.
